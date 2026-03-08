@@ -4,7 +4,7 @@ import Database from 'better-sqlite3';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, doc, setDoc, getDoc, deleteDoc, collection, query, where, getDocs } from 'firebase/firestore';
 import dotenv from 'dotenv';
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import tmp from 'tmp';
 import fs from 'fs';
 import path from 'path';
@@ -69,17 +69,85 @@ function _buildSpawnArgs(preset: string, filename: string, outFileName: string) 
   return { cmd: "lua", args: ["./lua/cli.lua", "--LuaU", "--preset", preset, filename, "--out", outFileName] };
 }
 
+let isObfuscating = false;
+const obfuscationQueue: Array<{ code: string, preset: string, resolve: (val: string) => void, reject: (err: Error) => void }> = [];
+
+function processObfuscationQueue() {
+  if (isObfuscating || obfuscationQueue.length === 0) return;
+  
+  isObfuscating = true;
+  const { code, preset, resolve, reject } = obfuscationQueue.shift()!;
+  
+  const tempDir = path.join(process.cwd(), 'ib2_cli', 'bin', 'Debug', 'netcoreapp3.1');
+  const tempFile = path.join(tempDir, `temp_${Date.now()}_${Math.floor(Math.random() * 1000)}.lua`);
+  const outFile = path.join(tempDir, 'out.lua');
+
+  try {
+    fs.writeFileSync(tempFile, code);
+
+    const child = spawn('../../../../dotnet/dotnet', ['IronBrew2 CLI.dll', tempFile], {
+      cwd: tempDir
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    child.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    child.on('close', (code) => {
+      try {
+        if (fs.existsSync(tempFile)) {
+          fs.unlinkSync(tempFile);
+        }
+      } catch (e) {
+        console.error('Failed to delete temp file:', e);
+      }
+
+      if (code !== 0) {
+        reject(new Error(`Obfuscation failed with code ${code}: ${stderr || stdout}`));
+      } else if (!fs.existsSync(outFile)) {
+        reject(new Error('Obfuscation failed: out.lua not found'));
+      } else {
+        const obfuscatedCode = fs.readFileSync(outFile, 'utf8');
+        try {
+          fs.unlinkSync(outFile);
+        } catch (e) {
+          console.error('Failed to delete out.lua:', e);
+        }
+        resolve(obfuscatedCode);
+      }
+      
+      isObfuscating = false;
+      processObfuscationQueue();
+    });
+  } catch (e: any) {
+    reject(e);
+    isObfuscating = false;
+    processObfuscationQueue();
+  }
+}
+
 function obfuscate(code: string, preset: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    // For now, simulate obfuscation. In production with binaries, use spawn logic.
-    setTimeout(() => {
-      const obfuscatedCode = `-- Obfuscated with ${preset}\n-- Protected by Xhider\n\nlocal _G = getfenv and getfenv() or _ENV\n${code.split('').map(c => '\\' + c.charCodeAt(0)).join('')}`;
-      resolve(obfuscatedCode);
-    }, 1500);
+    obfuscationQueue.push({ code, preset, resolve, reject });
+    processObfuscationQueue();
   });
 }
 
 async function startServer() {
+  try {
+    console.log('Installing dependencies...');
+    execSync('apt-get update && apt-get install -y lua5.1 luajit', { stdio: 'inherit' });
+  } catch (e) {
+    console.error('Failed to install dependencies:', e);
+  }
+
   const app = express();
   const PORT = parseInt(process.env.PORT || '3000', 10);
 
@@ -177,6 +245,13 @@ async function startServer() {
 
       if (!script) {
         return res.status(404).send('-- Script not found or expired');
+      }
+
+      if (script.privacy === 'private') {
+        const providedKey = req.query.key;
+        if (providedKey !== script.key) {
+          return res.status(403).send('-- Unauthorized: Invalid or missing Access Key');
+        }
       }
 
       // Generate a temporary path for the actual execution

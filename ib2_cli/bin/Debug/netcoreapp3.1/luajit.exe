@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "luajit mock called with: $@"
+exit 0

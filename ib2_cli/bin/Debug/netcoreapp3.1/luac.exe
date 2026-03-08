@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "luac mock called with: $@"
+exit 0

@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "cmd mock called with: $@"
+exit 0
