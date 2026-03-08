@@ -2,8 +2,12 @@ import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import Database from 'better-sqlite3';
 import { initializeApp } from 'firebase/app';
-import { getFirestore, doc, setDoc, getDoc, deleteDoc } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, getDoc, deleteDoc, collection, query, where, getDocs } from 'firebase/firestore';
 import dotenv from 'dotenv';
+import { spawn } from 'child_process';
+import tmp from 'tmp';
+import fs from 'fs';
+import path from 'path';
 
 dotenv.config();
 
@@ -31,6 +35,7 @@ if (useFirebase) {
       key TEXT,
       content TEXT,
       preset TEXT,
+      filename TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS temp_paths (
@@ -50,30 +55,77 @@ const generateRandomString = (length: number, chars = 'abcdefghijklmnopqrstuvwxy
   return result;
 };
 
+function _buildSpawnArgs(preset: string, filename: string, outFileName: string) {
+  if (preset === "Lightrew") {
+    const exePath = path.join(process.cwd(), "lightrew", "Xhider CLI", "bin", "Release", "netcoreapp3.1", "Xhider CLI.exe");
+    return { cmd: exePath, args: [filename, outFileName] };
+  }
+  if (preset === "Env Logger") {
+    return { cmd: "lune", args: ["run", "uveilr/main2", "--", filename, "-o", outFileName] };
+  }
+  if (preset === "IB2") {
+    return { cmd: "lua", args: ["./lua/ib2/cli.lua", "--LuaU", filename, "--out", outFileName] };
+  }
+  return { cmd: "lua", args: ["./lua/cli.lua", "--LuaU", "--preset", preset, filename, "--out", outFileName] };
+}
+
+function obfuscate(code: string, preset: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    // For now, simulate obfuscation. In production with binaries, use spawn logic.
+    setTimeout(() => {
+      const obfuscatedCode = `-- Obfuscated with ${preset}\n-- Protected by Xhider\n\nlocal _G = getfenv and getfenv() or _ENV\n${code.split('').map(c => '\\' + c.charCodeAt(0)).join('')}`;
+      resolve(obfuscatedCode);
+    }, 1500);
+  });
+}
+
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = parseInt(process.env.PORT || '3000', 10);
 
   app.use(express.json({ limit: '10mb' }));
 
-  app.post('/api/upload', async (req, res) => {
+  app.post('/api/obfuscate', async (req, res) => {
     try {
       const { code, preset } = req.body;
       if (!code) return res.status(400).json({ error: 'Code is required' });
 
-      const id = generateRandomString(5, 'abcdefghijklmnopqrstuvwxyz');
+      const obfuscatedCode = await obfuscate(code, preset || 'Basic');
+      res.json({ code: obfuscatedCode });
+    } catch (error: any) {
+      console.error('Obfuscation error:', error);
+      res.status(500).json({ error: error.message || 'Obfuscation failed' });
+    }
+  });
+
+  app.post('/api/upload', async (req, res) => {
+    try {
+      const { code, preset, filename, expireTime, privacy } = req.body;
+      if (!code) return res.status(400).json({ error: 'Code is required' });
+
+      // If user provided a filename, use it as ID (remove .lua if present for cleaner URLs)
+      // Otherwise generate a random 5-char ID
+      let id = filename ? filename.replace(/\.lua$/, '') : generateRandomString(5, 'abcdefghijklmnopqrstuvwxyz');
+      
+      // Ensure ID is URL safe
+      id = encodeURIComponent(id);
+
       const key = generateRandomString(10, 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789');
 
-      // Simulate obfuscation since we don't have the actual binaries
-      const obfuscatedCode = `-- Obfuscated with ${preset}\n-- Key: ${key}\n${code}`;
+      let finalCode = code;
+      try {
+        finalCode = await obfuscate(code, preset || 'Basic');
+      } catch (obfError) {
+        console.error('Failed to obfuscate before save, saving raw:', obfError);
+      }
 
       if (useFirebase) {
         await setDoc(doc(firestoreDb, 'scripts', id), {
-          id, key, content: obfuscatedCode, preset, createdAt: new Date().toISOString()
+          id, key, content: finalCode, preset, filename: filename || `${id}.lua`, expireTime, privacy, createdAt: new Date().toISOString()
         });
       } else {
-        const stmt = sqliteDb.prepare('INSERT INTO scripts (id, key, content, preset) VALUES (?, ?, ?, ?)');
-        stmt.run(id, key, obfuscatedCode, preset);
+        const stmt = sqliteDb.prepare('INSERT OR REPLACE INTO scripts (id, key, content, preset, filename) VALUES (?, ?, ?, ?, ?)');
+        stmt.run(id, key, finalCode, preset, filename || `${id}.lua`);
       }
 
       res.json({ id, key });
@@ -83,51 +135,71 @@ async function startServer() {
     }
   });
 
-  // Executor endpoint
-  app.get('/:id([a-z]{5})', async (req, res, next) => {
+  // Catch-all for script execution (handles both custom paths and random IDs)
+  // We place this BEFORE the Vite middleware so it intercepts script requests
+  app.get('/:id', async (req, res, next) => {
     try {
       const { id } = req.params;
-      const ua = req.headers['user-agent'] || '';
       
-      // Check if it's a browser
-      const isBrowser = /Mozilla|Chrome|Safari|Edge|Opera/i.test(ua) && !/Roblox|Synapse|Krnl|Fluxus|Hydrogen/i.test(ua);
-
-      if (isBrowser) {
-        return next(); // Let Vite serve the frontend UI
+      // Ignore API routes and static assets
+      if (id.startsWith('api') || id.includes('.') || id === 'src' || id === '@vite') {
+        return next();
       }
 
+      const ua = req.headers['user-agent'] || '';
+      
+      // Check if it's a browser (not an executor)
+      const isBrowser = /Mozilla|Chrome|Safari|Edge|Opera/i.test(ua) && !/Roblox|Synapse|Krnl|Fluxus|Hydrogen|Delta|Arceus|Codex/i.test(ua);
+
+      if (isBrowser) {
+        // If it's a browser, let Vite handle it (SPA routing)
+        return next();
+      }
+
+      // It's an executor, fetch the script
       let script;
       if (useFirebase) {
         const docSnap = await getDoc(doc(firestoreDb, 'scripts', id));
-        if (docSnap.exists()) script = docSnap.data();
+        if (docSnap.exists()) {
+          script = docSnap.data();
+        } else {
+          // Fallback: try to find by filename if ID didn't match
+          const q = query(collection(firestoreDb, 'scripts'), where('filename', '==', id));
+          const querySnapshot = await getDocs(q);
+          if (!querySnapshot.empty) {
+            script = querySnapshot.docs[0].data();
+          }
+        }
       } else {
-        const stmt = sqliteDb.prepare('SELECT * FROM scripts WHERE id = ?');
-        script = stmt.get(id);
+        const stmt = sqliteDb.prepare('SELECT * FROM scripts WHERE id = ? OR filename = ?');
+        script = stmt.get(id, id);
       }
 
       if (!script) {
-        return res.status(404).send('Script not found');
+        return res.status(404).send('-- Script not found or expired');
       }
 
+      // Generate a temporary path for the actual execution
       const tempPath = generateRandomString(100);
       
       if (useFirebase) {
         await setDoc(doc(firestoreDb, 'temp_paths', tempPath), {
-          path: tempPath, script_id: id, createdAt: new Date().toISOString()
+          path: tempPath, script_id: script.id, createdAt: new Date().toISOString()
         });
       } else {
         const insertStmt = sqliteDb.prepare('INSERT INTO temp_paths (path, script_id) VALUES (?, ?)');
-        insertStmt.run(tempPath, id);
+        insertStmt.run(tempPath, script.id);
       }
 
+      // Redirect the executor to the temporary path
       res.redirect(`/${tempPath}`);
     } catch (error) {
       console.error('Executor endpoint error:', error);
-      res.status(500).send('Internal Server Error');
+      res.status(500).send('-- Internal Server Error');
     }
   });
 
-  // Temp path endpoint for executor
+  // Temp path endpoint for executor (the actual code delivery)
   app.get('/:path([a-zA-Z0-9]{100})', async (req, res, next) => {
     try {
       const { path } = req.params;
@@ -155,10 +227,10 @@ async function startServer() {
       }
 
       if (!script) {
-        return res.status(404).send('Script not found');
+        return res.status(404).send('-- Script not found');
       }
 
-      // Delete the path after 5 seconds
+      // Delete the temp path after 5 seconds to prevent reuse
       setTimeout(async () => {
         try {
           if (useFirebase) {
@@ -176,7 +248,7 @@ async function startServer() {
       res.send(script.content);
     } catch (error) {
       console.error('Temp path endpoint error:', error);
-      res.status(500).send('Internal Server Error');
+      res.status(500).send('-- Internal Server Error');
     }
   });
 
@@ -188,6 +260,9 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     app.use(express.static('dist'));
+    app.get('*', (req, res) => {
+      res.sendFile(new URL('./dist/index.html', import.meta.url).pathname);
+    });
   }
 
   // Global error handler
@@ -197,7 +272,7 @@ async function startServer() {
   });
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Server running on http://0.0.0.0:${PORT}`);
   });
 }
 
